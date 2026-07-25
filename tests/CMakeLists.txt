@@ -9,3 +9,7 @@ add_executable(test_vision_common test_vision_common.cpp)
 target_include_directories(test_vision_common PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_compile_options(test_vision_common PRIVATE -Wall -Wextra)
 add_test(NAME vision_common COMMAND test_vision_common)
+
+add_executable(test_q8_quant test_q8_quant.cpp)
+target_compile_options(test_q8_quant PRIVATE -Wall -Wextra)
+add_test(NAME q8_quant COMMAND test_q8_quant)

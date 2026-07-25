@@ -864,12 +864,51 @@ static void vram_probe(ggml_backend_t backend, const char * label) {
     have_prev = true;
 }
 
+// Q8_0 block quantization: one float16 scale + 32 int8 values per block.
+// Matches GGML's block_q8_0 layout so ggml kernels can operate directly.
+#define VLA_QK8_0 32
+struct vla_block_q8_0 {
+    ggml_fp16_t d;
+    int8_t      qs[VLA_QK8_0];
+};
+
+static void quantize_row_q8_0(const float * x, void * y, int64_t k) {
+    const int64_t nb = k / VLA_QK8_0;
+    for (int64_t i = 0; i < nb; ++i) {
+        float amax = 0.0f;
+        for (int64_t j = 0; j < VLA_QK8_0; ++j) {
+            const float v = x[i * VLA_QK8_0 + j];
+            if (v < -amax) amax = -v;
+            if (v >  amax) amax =  v;
+        }
+        const float d  = amax / 127.0f;
+        const float id = d > 0.0f ? 1.0f / d : 0.0f;
+        vla_block_q8_0 & b = ((vla_block_q8_0 *)y)[i];
+        b.d = ggml_fp32_to_fp16(d);
+        for (int64_t j = 0; j < VLA_QK8_0; ++j) {
+            b.qs[j] = (int8_t)(std::lrint(x[i * VLA_QK8_0 + j] * id));
+        }
+    }
+}
+
+static void dequantize_row_q8_0(const void * x, float * y, int64_t k) {
+    const int64_t nb = k / VLA_QK8_0;
+    for (int64_t i = 0; i < nb; ++i) {
+        const vla_block_q8_0 & b = ((const vla_block_q8_0 *)x)[i];
+        const float d = ggml_fp16_to_fp32(b.d);
+        for (int64_t j = 0; j < VLA_QK8_0; ++j) {
+            y[i * VLA_QK8_0 + j] = (float)b.qs[j] * d;
+        }
+    }
+}
+
 static ggml_type resolve_weight_dtype() {
     const char * e = std::getenv("VLA_WEIGHT_DTYPE");
     if (!e) return GGML_TYPE_BF16;
     if (std::strcmp(e, "f32")  == 0) return GGML_TYPE_F32;
     if (std::strcmp(e, "bf16") == 0) return GGML_TYPE_BF16;
     if (std::strcmp(e, "f16")  == 0) return GGML_TYPE_F16;
+    if (std::strcmp(e, "q8_0") == 0) return GGML_TYPE_Q8_0;
     std::fprintf(stderr, "vla: unknown VLA_WEIGHT_DTYPE='%s', using bf16\n", e);
     return GGML_TYPE_BF16;
 }
@@ -889,6 +928,13 @@ static void backend_set_from_f32(ggml_tensor * t, const float * src, int64_t n) 
             std::vector<ggml_bf16_t> tmp(n);
             ggml_fp32_to_bf16_row(src, tmp.data(), n);
             ggml_backend_tensor_set(t, tmp.data(), 0, n * sizeof(ggml_bf16_t));
+            break;
+        }
+        case GGML_TYPE_Q8_0: {
+            const size_t qbytes = ggml_nbytes(t);
+            std::vector<int8_t> tmp(qbytes);
+            quantize_row_q8_0(src, tmp.data(), n);
+            ggml_backend_tensor_set(t, tmp.data(), 0, qbytes);
             break;
         }
         default:
