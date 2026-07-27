@@ -31,7 +31,9 @@ import gguf
 # head, norms, conv, position tables and the action expert stay float. The vision
 # tower stays float too by default; add --vision to pack it as well.
 SKIP = ("token_embd", "output.weight", "patch_embd", "norm", "pos", "embed",
-        "cls", "action", "state", "expert", "dit", "adaln", "ada_", "time")
+        "modality_projection", "mm.fc",
+        "cls", "action", "state", "expert", "dit", "adaln", "ada_", "time",
+        "attn_q", "attn_k", "attn_v", "attn_o", "q_proj", "k_proj", "v_proj", "o_proj")
 SKIP_VISION = ("vit", "vision")
 
 # Block size per row (ne0 must divide this). Only the types the gguf writer can

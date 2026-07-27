@@ -19,6 +19,9 @@ COPY . .
 
 ARG BACKEND=cuda
 ARG CUDA_ARCH=120
+# For CPU (ARM) builds, pass ArmTune-recommended cmake flags, e.g.
+#   --build-arg EXTRA_CMAKE_FLAGS="-DGGML_NATIVE=ON -DGGML_CPU_KLEIDIAI=ON"
+ARG EXTRA_CMAKE_FLAGS=
 # nvcc can segfault on the flash-attn kernels under high -j; lower JOBS if so.
 ARG JOBS=
 # CUDA: -devel ships only a libcuda stub (real driver injected at runtime), so
@@ -30,7 +33,7 @@ RUN set -eux; \
               -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCH}" \
               -DCMAKE_SHARED_LINKER_FLAGS="-lcuda" -DCMAKE_EXE_LINKER_FLAGS="-lcuda"; \
     else \
-        cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=OFF; \
+        cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=OFF ${EXTRA_CMAKE_FLAGS}; \
     fi; \
     cmake --build build -j"${JOBS:-$(nproc)}" --target vla-server vla-cli; \
     cp build/vla-server build/vla-cli /usr/local/bin/

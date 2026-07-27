@@ -199,6 +199,39 @@ struct gguf_source {
             std::vector<ggml_bf16_t> tmp(bytes / sizeof(ggml_bf16_t));
             if (std::fread(tmp.data(), 1, bytes, fp) != bytes) return false;
             ggml_bf16_to_fp32_row(tmp.data(), dst, tmp.size());
+        } else if (t->type == GGML_TYPE_Q8_0) {
+            const int64_t n = ggml_nelements(t);
+            const int64_t qk = 32;
+            if (n % qk != 0) { std::fprintf(stderr, "vla: tensor %s size %lld not multiple of %lld for Q8_0\n", name.c_str(), (long long)n, (long long)qk); return false; }
+            const int64_t nb = n / qk;
+            const size_t block_size = sizeof(ggml_fp16_t) + qk * sizeof(int8_t); // 2 + 32 = 34
+            std::vector<uint8_t> raw(bytes);
+            if (std::fread(raw.data(), 1, bytes, fp) != bytes) return false;
+            for (int64_t i = 0; i < nb; ++i) {
+                const float d = ggml_fp16_to_fp32(*(const ggml_fp16_t *)(raw.data() + i * block_size));
+                const int8_t * qs = (const int8_t *)(raw.data() + i * block_size + sizeof(ggml_fp16_t));
+                for (int64_t j = 0; j < qk; ++j) {
+                    dst[i * qk + j] = (float)qs[j] * d;
+                }
+            }
+        } else if (t->type == GGML_TYPE_Q4_0) {
+            const int64_t n = ggml_nelements(t);
+            const int64_t qk = 32;
+            if (n % qk != 0) { std::fprintf(stderr, "vla: tensor %s size %lld not multiple of %lld for Q4_0\n", name.c_str(), (long long)n, (long long)qk); return false; }
+            const int64_t nb = n / qk;
+            const size_t block_size = sizeof(ggml_fp16_t) + qk / 2;
+            std::vector<uint8_t> raw(bytes);
+            if (std::fread(raw.data(), 1, bytes, fp) != bytes) return false;
+            for (int64_t i = 0; i < nb; ++i) {
+                const float d = ggml_fp16_to_fp32(((const ggml_fp16_t *)(raw.data() + i * block_size))[0]);
+                const uint8_t * qs = raw.data() + i * block_size + sizeof(ggml_fp16_t);
+                for (int64_t j = 0; j < qk / 2; ++j) {
+                    const int x0 = (qs[j] & 0x0F) - 8;
+                    const int x1 = (qs[j] >>   4) - 8;
+                    dst[i * qk + j + 0]      = (float)x0 * d;
+                    dst[i * qk + j + qk / 2] = (float)x1 * d;
+                }
+            }
         } else {
             std::fprintf(stderr, "vla: gguf unsupported dtype %d for %s\n",
                          (int) t->type, name.c_str());
@@ -341,6 +374,13 @@ struct SmolVLAModelArch : public ModelArchBase {
     ggml_tensor * out_x_t          = nullptr;
 
     std::vector<ggml_tensor *> time_bcasts;
+
+    // Vision skip cache: when > 0, reuse stale vision embeddings for this many
+    // consecutive predict() calls before re-running the SigLIP tower.
+    // Set via VLA_VISION_SKIP env var (default: 0 = recompute every call).
+    int vision_skip = 0;
+    int vision_stale = 0;
+    std::vector<float> img_emb_cache;
 };
 
 namespace {
@@ -902,6 +942,54 @@ static void dequantize_row_q8_0(const void * x, float * y, int64_t k) {
     }
 }
 
+// Q4_0 block quantization: one float16 scale + 16 bytes of 4-bit nibbles.
+// Matches GGML's block_q4_0 layout so ggml kernels can operate directly.
+#define VLA_QK4_0 32
+struct vla_block_q4_0 {
+    ggml_fp16_t d;
+    uint8_t     qs[VLA_QK4_0 / 2];  // two 4-bit quants per byte
+};
+
+static void quantize_row_q4_0(const float * x, void * y, int64_t k) {
+    const int64_t nb = k / VLA_QK4_0;
+    for (int64_t i = 0; i < nb; ++i) {
+        float amax = 0.0f;
+        float max  = 0.0f;
+        for (int64_t j = 0; j < VLA_QK4_0; ++j) {
+            const float v = x[i * VLA_QK4_0 + j];
+            if (std::fabs(v) > amax) {
+                amax = std::fabs(v);
+                max  = v;
+            }
+        }
+        const float d  = max / -8.0f;
+        const float id = d != 0.0f ? 1.0f / d : 0.0f;
+        vla_block_q4_0 & b = ((vla_block_q4_0 *)y)[i];
+        b.d = ggml_fp32_to_fp16(d);
+        for (int64_t j = 0; j < VLA_QK4_0 / 2; ++j) {
+            const float x0 = x[i * VLA_QK4_0 + 0         + j] * id;
+            const float x1 = x[i * VLA_QK4_0 + VLA_QK4_0/2 + j] * id;
+            const uint8_t xi0 = (uint8_t)std::min(15, (int)(x0 + 8.5f));
+            const uint8_t xi1 = (uint8_t)std::min(15, (int)(x1 + 8.5f));
+            b.qs[j] = xi0 | (xi1 << 4);
+        }
+    }
+}
+
+static void dequantize_row_q4_0(const void * x, float * y, int64_t k) {
+    const int64_t nb = k / VLA_QK4_0;
+    for (int64_t i = 0; i < nb; ++i) {
+        const vla_block_q4_0 & b = ((const vla_block_q4_0 *)x)[i];
+        const float d = ggml_fp16_to_fp32(b.d);
+        for (int64_t j = 0; j < VLA_QK4_0 / 2; ++j) {
+            const int x0 = (b.qs[j] & 0x0F) - 8;
+            const int x1 = (b.qs[j] >>   4) - 8;
+            y[i * VLA_QK4_0 + j + 0]            = (float)x0 * d;
+            y[i * VLA_QK4_0 + j + VLA_QK4_0 / 2] = (float)x1 * d;
+        }
+    }
+}
+
 static ggml_type resolve_weight_dtype() {
     const char * e = std::getenv("VLA_WEIGHT_DTYPE");
     if (!e) return GGML_TYPE_BF16;
@@ -909,6 +997,7 @@ static ggml_type resolve_weight_dtype() {
     if (std::strcmp(e, "bf16") == 0) return GGML_TYPE_BF16;
     if (std::strcmp(e, "f16")  == 0) return GGML_TYPE_F16;
     if (std::strcmp(e, "q8_0") == 0) return GGML_TYPE_Q8_0;
+    if (std::strcmp(e, "q4_0") == 0) return GGML_TYPE_Q4_0;
     std::fprintf(stderr, "vla: unknown VLA_WEIGHT_DTYPE='%s', using bf16\n", e);
     return GGML_TYPE_BF16;
 }
@@ -937,6 +1026,13 @@ static void backend_set_from_f32(ggml_tensor * t, const float * src, int64_t n) 
             ggml_backend_tensor_set(t, tmp.data(), 0, qbytes);
             break;
         }
+        case GGML_TYPE_Q4_0: {
+            const size_t qbytes = ggml_nbytes(t);
+            std::vector<uint8_t> tmp(qbytes);
+            quantize_row_q4_0(src, tmp.data(), n);
+            ggml_backend_tensor_set(t, tmp.data(), 0, qbytes);
+            break;
+        }
         default:
             std::fprintf(stderr, "vla: backend_set_from_f32: unsupported dtype %d\n",
                          (int) t->type);
@@ -948,6 +1044,16 @@ SmolVLAModelArch* smolvla_load_impl(const std::string& mmproj_path,
                                     const std::string& ckpt_path,
                                     const std::string& config_path) {
     auto* m = new SmolVLAModelArch();
+
+    {
+        const char * e = std::getenv("VLA_VISION_SKIP");
+        if (e) {
+            m->vision_skip = std::atoi(e);
+            if (m->vision_skip < 0) m->vision_skip = 0;
+            std::fprintf(stderr, "vla(smolvla): VLA_VISION_SKIP=%d (compute every %dth call)\n",
+                         m->vision_skip, std::max(1, m->vision_skip));
+        }
+    }
 
     const bool use_gguf = ends_with_gguf(ckpt_path);
     safetensors  st;
@@ -1088,10 +1194,12 @@ SmolVLAModelArch* smolvla_load_impl(const std::string& mmproj_path,
 
     if (use_gguf) {
         if (!load_normalizer_stats_from_gguf(gst, *m)) {
-            std::fprintf(stderr, "vla: failed to load normalizer stats from gguf\n");
-            ggml_backend_free(m->backend);
-            delete m;
-            return nullptr;
+            std::fprintf(stderr, "vla: warning: failed to load normalizer stats from gguf, "
+                                 "using defaults (mean=0, std=1)\n");
+            m->state_mean .assign(m->cfg.real_state_dim,  0.f);
+            m->state_std  .assign(m->cfg.real_state_dim,  1.f);
+            m->action_mean.assign(m->cfg.real_action_dim, 0.f);
+            m->action_std .assign(m->cfg.real_action_dim, 1.f);
         }
     } else {
         const std::string cfg_path_local = config_path.empty()
@@ -1527,9 +1635,20 @@ std::vector<float> predict_impl(SmolVLAModelArch* m, const Inputs& in) {
         img_emb_n = per_view_n * size_t(n_views);
         img_emb_pre.resize(img_emb_n);
 
-        const int64_t H = m->vit_hidden, grid = m->vit_image / m->vit_patch, n_patches = grid * grid;
-        const int64_t s = m->vit_scale, c4 = H * s * s, K = m->vit_n_tokens;
-        const auto t_vision_begin = clock::now();
+        // Vision skip cache: reuse stale embeddings when VLA_VISION_SKIP > 1
+        // and we haven't exhausted the skip budget.
+        // VISION_SKIP=N means: compute every Nth call, skip N-1 between.
+        // skip=1: compute every call (baseline), skip=2: every 2nd call, etc.
+        // VISION_SKIP=0 also means always compute (original behavior).
+        if (m->vision_skip > 1 && m->vision_stale < m->vision_skip - 1
+            && m->img_emb_cache.size() == img_emb_n) {
+            m->vision_stale++;
+            std::memcpy(img_emb_pre.data(), m->img_emb_cache.data(), img_emb_n * sizeof(float));
+            m->stats.ms_vision = 0.0f;
+        } else {
+            const int64_t H = m->vit_hidden, grid = m->vit_image / m->vit_patch, n_patches = grid * grid;
+            const int64_t s = m->vit_scale, c4 = H * s * s, K = m->vit_n_tokens;
+            const auto t_vision_begin = clock::now();
 
         // Graph A: SigLIP ViT (conv patch-embed -> +pos -> layers -> post_ln), plain sequential positions.
         ggml_init_params vpA = { size_t(256) * 1024 * 1024, nullptr, true };
@@ -1589,6 +1708,12 @@ std::vector<float> predict_impl(SmolVLAModelArch* m, const Inputs& in) {
         ggml_gallocr_free(vgB); ggml_free(MC); ggml_gallocr_free(vgA); ggml_free(VC);
         if (!vok) return {};
         m->stats.ms_vision = std::chrono::duration<float, std::milli>(clock::now() - t_vision_begin).count();
+
+            // Cache the freshly computed embeddings for future skip reuse.
+            m->img_emb_cache.resize(img_emb_n);
+            std::memcpy(m->img_emb_cache.data(), img_emb_pre.data(), img_emb_n * sizeof(float));
+            m->vision_stale = 0;
+        }  // end vision skip: full compute
     }
 
     cfg.n_img    = m->cfg.n_img * int64_t(n_views);

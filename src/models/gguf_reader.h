@@ -16,12 +16,18 @@
 // (dequantizing BF16), passes packed bytes through when the resident type is not
 // float, and fetches token-embedding rows on demand. The arch name only labels
 // error messages.
+//
+// Also handles tensor-level Q4_0/Q8_0 dequantization for read_f32, which is
+// needed when the model has already been quantized on disk and the caller
+// requests F32 weights (e.g., state projection matrices).
 
 #pragma once
 
 #include "ggml.h"
 #include "gguf.h"
 
+#include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -88,6 +94,42 @@ struct gguf_reader {
         std::vector<float> out(n);
         if (t->type == GGML_TYPE_F32) { if (!read_raw(name, out.data())) return {}; }
         else if (t->type == GGML_TYPE_BF16) { std::vector<ggml_bf16_t> tmp(n); if (!read_raw(name, tmp.data())) return {}; ggml_bf16_to_fp32_row(tmp.data(), out.data(), n); }
+        else if (t->type == GGML_TYPE_Q8_0) {
+            // Q8_0 dequantization: one float16 scale + 32 int8 values per block
+            const int64_t qk = 32;
+            const int64_t nb = n / qk;
+            if (n % qk != 0) { std::fprintf(stderr, "vla(%s): tensor %s size %lld not multiple of %lld for Q8_0\n", arch, name, (long long)n, (long long)qk); return {}; }
+            const size_t block_size = sizeof(ggml_fp16_t) + qk * sizeof(int8_t); // 2 + 32 = 34
+            std::vector<uint8_t> raw(ggml_nbytes(t));
+            if (!read_raw(name, raw.data())) return {};
+            for (int64_t i = 0; i < nb; ++i) {
+                const float d = ggml_fp16_to_fp32(*(const ggml_fp16_t *)(raw.data() + i * block_size));
+                const int8_t * qs = (const int8_t *)(raw.data() + i * block_size + sizeof(ggml_fp16_t));
+                for (int64_t j = 0; j < qk; ++j) {
+                    out[i * qk + j] = (float)qs[j] * d;
+                }
+            }
+        }
+        else if (t->type == GGML_TYPE_Q4_0) {
+            // Q4_0 dequantization: one float16 scale + 16 bytes of 4-bit nibbles
+            const int64_t qk = 32;
+            const int64_t nb = n / qk;
+            if (n % qk != 0) { std::fprintf(stderr, "vla(%s): tensor %s size %lld not multiple of %lld for Q4_0\n", arch, name, (long long)n, (long long)qk); return {}; }
+            const size_t block_size = sizeof(ggml_fp16_t) + qk / 2;  // 2 + 16 = 18 bytes
+            std::vector<uint8_t> raw(ggml_nbytes(t));
+            if (!read_raw(name, raw.data())) return {};
+            for (int64_t i = 0; i < nb; ++i) {
+                const ggml_fp16_t d_fp16 = ((const ggml_fp16_t *)(raw.data() + i * block_size))[0];
+                const float d = ggml_fp16_to_fp32(d_fp16);
+                const uint8_t * qs = raw.data() + i * block_size + sizeof(ggml_fp16_t);
+                for (int64_t j = 0; j < qk / 2; ++j) {
+                    const int x0 = (qs[j] & 0x0F) - 8;
+                    const int x1 = (qs[j] >>   4) - 8;
+                    out[i * qk + j + 0]       = (float)x0 * d;
+                    out[i * qk + j + qk / 2]  = (float)x1 * d;
+                }
+            }
+        }
         else { std::fprintf(stderr, "vla(%s): tensor %s unsupported type %d\n", arch, name, (int) t->type); return {}; }
         return out;
     }

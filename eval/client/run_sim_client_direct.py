@@ -53,6 +53,8 @@ if __name__ == "__main__":
         choices=["single-view", "multi-view"], default="multi-view",
         help="single-view: write one camera key; multi-view: side-by-side front+wrist.",
     )
+    parser.add_argument("--no-video", action="store_true",
+        help="Disable video recording (faster).")
     parser.add_argument("--seed", type=int, default=42,
         help="Seed for the LIBERO env reset/init-state rollout (default: 42).")
 
@@ -130,18 +132,17 @@ if __name__ == "__main__":
     else:
         client = LeRobotPipelineAdapter(client=client)
 
-    env = gym.make(
-        f"{args.task}/task_{args.task_id}",
-        seed=args.seed,
-        video_fps=args.fps,
-        output_video_dir=output_dir,
-        video_view_mode=args.view_mode,
-    )
+    env_kwargs = dict(seed=args.seed)
+    if not args.no_video:
+        env_kwargs.update(video_fps=args.fps, output_video_dir=output_dir,
+                          video_view_mode=args.view_mode)
+    env = gym.make(f"{args.task}/task_{args.task_id}", **env_kwargs)
 
     success_count, inference_times = 0.0, []
     skipped = 0
     for episode in range(args.n_episodes):
-        print(f"*** Episode {episode + 1}/{args.n_episodes}")
+        ep_t0 = time.time()
+        print(f"*** Episode {episode + 1}/{args.n_episodes}", flush=True)
 
         client.reset()
         obs, info = env.reset()
@@ -172,10 +173,10 @@ if __name__ == "__main__":
                 inference_times.append(avg_t)
                 success_count += info.get("is_success", 0.0)
 
-                print(f"- Episode finished after {step_id} steps.")
-                print(f"- Final reward: {reward:.2f}")
-                print(f"- Episode Information:\n{info}")
-                print(f"- Average inference time per step: {round(1000 * avg_t, 2)} ms")
+                print(f"- Episode finished after {step_id} steps. "
+                      f"reward={reward:.2f} success={info.get('is_success', 0.0)} "
+                      f"inf={round(1000 * avg_t, 1)}ms "
+                      f"time={round(time.time() - ep_t0, 0):.0f}s", flush=True)
                 break
 
         if episode_aborted:
@@ -193,7 +194,12 @@ if __name__ == "__main__":
         f.write(f"Skipped (terminated mid-step): {skipped}/{args.n_episodes}\n")
         f.write(f"Average inference time per step: {avg_inf_ms} ms\n")
 
-    print("*** All episodes completed.")
-    print(f"- Success rate: {success_count / counted:.2%}  ({int(success_count)}/{counted})")
-    print(f"- Skipped (terminated mid-step): {skipped}/{args.n_episodes}")
-    print(f"- Saved videos to: {output_dir.resolve()}")
+    if args.no_video:
+        print("*** All episodes completed.", flush=True)
+        print(f"- Success rate: {success_count / counted:.2%}  ({int(success_count)}/{counted})", flush=True)
+        print(f"- Skipped (terminated mid-step): {skipped}/{args.n_episodes}", flush=True)
+    else:
+        print("*** All episodes completed.", flush=True)
+        print(f"- Success rate: {success_count / counted:.2%}  ({int(success_count)}/{counted})", flush=True)
+        print(f"- Skipped (terminated mid-step): {skipped}/{args.n_episodes}", flush=True)
+        print(f"- Saved videos to: {output_dir.resolve()}", flush=True)

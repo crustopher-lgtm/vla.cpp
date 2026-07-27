@@ -13,3 +13,7 @@ add_test(NAME vision_common COMMAND test_vision_common)
 add_executable(test_q8_quant test_q8_quant.cpp)
 target_compile_options(test_q8_quant PRIVATE -Wall -Wextra)
 add_test(NAME q8_quant COMMAND test_q8_quant)
+
+add_executable(test_q4_quant test_q4_quant.cpp)
+target_compile_options(test_q4_quant PRIVATE -Wall -Wextra)
+add_test(NAME q4_quant COMMAND test_q4_quant)
