@@ -166,6 +166,8 @@ The GR00T models need two extras:
 - client side: `--stats-json /path/to/dataset_statistics.json`
 - server side: `VLA_GR00T_EMBODIMENT` (`new_embodiment` for N1.5, `libero_panda` for N1.6, `libero_sim` for N1.7) and `VLA_GR00T_BF16_WEIGHTS=1` (to fit the 8 GB card).
 
+CPU thread count defaults to the machine core count; override it with `VLA_N_THREADS` (e.g. `VLA_N_THREADS=2 ./build/vla-server ...`).
+
 ### SimplerEnv
 
 So far only **GR00T-N1.6** is wired (the `gr00t-n1d6-bridge` checkpoint with the `oxe_widowx` embodiment). Start `vla-server` on port 5566 with `oxe_widowx` embodiment:

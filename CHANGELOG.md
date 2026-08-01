@@ -2,6 +2,11 @@
 
 Notable changes to vla.cpp. Format loosely follows [Keep a Changelog](https://keepachangelog.com).
 
+## [Unreleased]
+
+### Added
+- `VLA_N_THREADS` env var to override the CPU thread count at startup. Unset or invalid values fall back to the machine core count.
+
 ## [0.1.1] - 2026-07-04
 
 ### Added

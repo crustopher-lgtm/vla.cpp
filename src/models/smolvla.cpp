@@ -1104,8 +1104,12 @@ SmolVLAModelArch* smolvla_load_impl(const std::string& mmproj_path,
             delete m;
             return nullptr;
         }
-        ggml_backend_cpu_set_n_threads(m->backend, default_cpu_threads());
-        std::printf("vla: backend = CPU (%d threads)\n", default_cpu_threads());
+        int n_threads = default_cpu_threads();
+        const char * env_t = std::getenv("VLA_N_THREADS");
+        if (env_t) n_threads = std::atoi(env_t);
+        if (n_threads < 1) n_threads = 1;
+        ggml_backend_cpu_set_n_threads(m->backend, n_threads);
+        std::printf("vla: backend = CPU (%d threads)\n", n_threads);
     }
     vram_probe(m->backend, "after backend init");
 
