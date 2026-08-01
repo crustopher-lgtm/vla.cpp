@@ -347,6 +347,13 @@ struct SmolVLAModelArch : public ModelArchBase {
     ggml_tensor *  W_at2   = nullptr;
     ggml_tensor *  b_at2   = nullptr;
 
+    // SnapFlow time embedding MLP (replaces action_time_mlp when present)
+    bool                  snapflow    = false;
+    ggml_tensor *  W_st_mlp0 = nullptr;
+    ggml_tensor *  b_st_mlp0 = nullptr;
+    ggml_tensor *  W_st_mlp2 = nullptr;
+    ggml_tensor *  b_st_mlp2 = nullptr;
+
     ggml_tensor *  W_aout  = nullptr;
     ggml_tensor *  b_aout  = nullptr;
 
@@ -1689,7 +1696,8 @@ std::vector<float> predict_impl(SmolVLAModelArch* m, const Inputs& in) {
             return {};
         }
 
-        std::vector<float> chw, post_host((size_t) H * n_patches), shuf_host((size_t) c4 * K);
+        std::vector<float> chw, post_host((size_t) H * n_patches),
+                            shuf_host((size_t) c4 * K_in), up_host((size_t) c4 * K_out);
         bool vok = true;
         for (int v = 0; v < n_views && vok; ++v) {
             if (!preprocess_image_chw(in.images[v], m->vit_image, chw)) { vok = false; break; }
@@ -1699,7 +1707,8 @@ std::vector<float> predict_impl(SmolVLAModelArch* m, const Inputs& in) {
             }
             ggml_backend_tensor_get(post_ln, post_host.data(), 0, ggml_nbytes(post_ln));
             pixel_shuffle_hf(post_host.data(), shuf_host.data(), H, grid, s);
-            ggml_backend_tensor_set(t_shuf, shuf_host.data(), 0, ggml_nbytes(t_shuf));
+            bilinear_upsample_2d(shuf_host.data(), up_host.data(), c4, g2, g2_out);
+            ggml_backend_tensor_set(t_shuf, up_host.data(), 0, c4 * K_out * sizeof(float));
             if (ggml_backend_graph_compute(m->backend, gB) != GGML_STATUS_SUCCESS) {
                 std::fprintf(stderr, "vla(smolvla): connector compute failed (view %d)\n", v); vok = false; break;
             }

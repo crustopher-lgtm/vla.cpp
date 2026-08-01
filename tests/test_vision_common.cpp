@@ -75,5 +75,41 @@ int main() {
     assert(!vla::view_is_side(&dummy, 32, 224, 224));
 
     std::printf("test_vision_common: pixel_shuffle_hf c-innermost order OK\n");
+
+    // ── bilinear_upsample_2d tests ──────────────────────────────────────────
+    {
+        // Test 1: 4x4 → 8x8 (2× upsampling — original behavior preserved)
+        // Simple constant-value input: all pixel values should be identical after upsampling.
+        const int64_t channels = 3, g4 = 4, g8 = 8;
+        const int64_t n_in = g4 * g4, n_out = g8 * g8;
+        std::vector<float> in(n_in * channels, 42.0f);
+        std::vector<float> out(n_out * channels, -1.0f);
+        vla::bilinear_upsample_2d(in.data(), out.data(), channels, g4, g8);
+        for (int64_t i = 0; i < n_out * channels; ++i) {
+            if (out[i] != 42.0f) {
+                std::fprintf(stderr, "bilinear_upsample_2d(4→8): constant input produced %g at [%lld]\n",
+                            (double) out[i], (long long) i);
+                return 1;
+            }
+        }
+        std::printf("test_vision_common: bilinear_upsample_2d 4→8 constant OK\n");
+
+        // Test 2: 6x6 → 8x8 (1.33× upsampling — the 384×384 case)
+        const int64_t g6 = 6;
+        const int64_t n6 = g6 * g6, n8 = g8 * g8;
+        std::vector<float> in6(n6 * channels, 42.0f);
+        std::vector<float> out8(n8 * channels, -1.0f);
+        vla::bilinear_upsample_2d(in6.data(), out8.data(), channels, g6, g8);
+        for (int64_t i = 0; i < n8 * channels; ++i) {
+            if (out8[i] != 42.0f) {
+                std::fprintf(stderr, "bilinear_upsample_2d(6→8): constant input produced %g at [%lld]\n",
+                            (double) out8[i], (long long) i);
+                return 1;
+            }
+        }
+        std::printf("test_vision_common: bilinear_upsample_2d 6→8 constant OK\n");
+    }
+
+    std::printf("test_vision_common: all tests OK\n");
     return 0;
 }

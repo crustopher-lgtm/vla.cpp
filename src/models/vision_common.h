@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 
@@ -44,6 +45,38 @@ inline void pixel_shuffle_hf(const float * src, float * dst,
                                 (size_t) embed * sizeof(float));
                 }
         }
+}
+
+// Bilinear upsampling on a CHW buffer stored position-major (pos, channel).
+// src[K_in][channels] where K_in = g_in*g_in is a g_in×g_in spatial grid.
+// dst[K_out][channels] where K_out = g_out*g_out is a g_out×g_out spatial grid.
+// Uses align_corners=false coordinate mapping (PyTorch F.interpolate default).
+inline void bilinear_upsample_2d(const float * src, float * dst,
+                                  int64_t channels, int64_t g_in, int64_t g_out) {
+    const float scale = float(g_in) / float(g_out);
+    for (int64_t yo = 0; yo < g_out; ++yo) {
+        for (int64_t xo = 0; xo < g_out; ++xo) {
+            const float yf = (yo + 0.5f) * scale - 0.5f;
+            const float xf = (xo + 0.5f) * scale - 0.5f;
+            const int64_t y0 = std::max(int64_t(0), (int64_t) yf);
+            const int64_t x0 = std::max(int64_t(0), (int64_t) xf);
+            const int64_t y1 = std::min(y0 + 1, g_in - 1);
+            const int64_t x1 = std::min(x0 + 1, g_in - 1);
+            const float dy = yf - (float) y0;
+            const float dx = xf - (float) x0;
+            const float * p00 = src + (y0 * g_in + x0) * channels;
+            const float * p01 = src + (y0 * g_in + x1) * channels;
+            const float * p10 = src + (y1 * g_in + x0) * channels;
+            const float * p11 = src + (y1 * g_in + x1) * channels;
+            float * p_out = dst + (yo * g_out + xo) * channels;
+            for (int64_t c = 0; c < channels; ++c) {
+                const float v00 = p00[c], v01 = p01[c], v10 = p10[c], v11 = p11[c];
+                const float top  = v00 + (v01 - v00) * dx;
+                const float bot  = v10 + (v11 - v10) * dx;
+                p_out[c] = top + (bot - top) * dy;
+            }
+        }
+    }
 }
 
 }  // namespace vla
