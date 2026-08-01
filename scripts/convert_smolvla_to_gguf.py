@@ -334,6 +334,10 @@ def main() -> int:
         ("action_time_mlp_out.bias",   "action_time_mlp_out.bias"),
         ("action_out_proj.weight",     "action_out_proj.weight"),
         ("action_out_proj.bias",       "action_out_proj.bias"),
+        ("target_time_embed_mlp.0.weight", "snapflow_time_mlp_0.weight"),
+        ("target_time_embed_mlp.0.bias",   "snapflow_time_mlp_0.bias"),
+        ("target_time_embed_mlp.2.weight", "snapflow_time_mlp_2.weight"),
+        ("target_time_embed_mlp.2.bias",   "snapflow_time_mlp_2.bias"),
     ]:
         _add_one_tensor(writer, dst_name, sf.get_tensor(f"{PFX_PROJ}.{src_suf}"))
 

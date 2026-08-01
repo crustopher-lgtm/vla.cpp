@@ -678,6 +678,12 @@ std::string hf_to_gguf(const std::string & n) {
     if (n == "model.vlm_with_expert.lm_expert.norm.weight")
         return "aex.output_norm.weight";
 
+    // SnapFlow distilled time embedding MLP
+    if (n == "model.target_time_embed_mlp.0.weight") return "snapflow_time_mlp_0.weight";
+    if (n == "model.target_time_embed_mlp.0.bias")   return "snapflow_time_mlp_0.bias";
+    if (n == "model.target_time_embed_mlp.2.weight") return "snapflow_time_mlp_2.weight";
+    if (n == "model.target_time_embed_mlp.2.bias")   return "snapflow_time_mlp_2.bias";
+
     auto layer_translate = [&](const std::string & rest, const char * dst_blk) -> std::string {
 
         if (!starts_with(rest, "layers.")) return n;
@@ -1129,17 +1135,37 @@ SmolVLAModelArch* smolvla_load_impl(const std::string& mmproj_path,
         vu("smolvla.n_img_tokens", m->vit_n_tokens); vu("smolvla.vit_inter", m->vit_inter);
         if (gst.has_key("smolvla.vit_ln_eps")) m->vit_ln_eps = gst.get_f32("smolvla.vit_ln_eps");
     }
+    // After pixel-shuffle (÷vit_scale), optionally bilinear upsample to a higher token count.
+    // The KV stores the final token count (pixel-shuffled or upsampled).
     {
         const int64_t grid = m->vit_image / m->vit_patch;
         const int64_t k = grid / m->vit_scale;
-        if (k * k != m->vit_n_tokens) {
+        const int64_t kk = k * k;
+        if (m->vit_n_tokens == kk) {
+            // Standard pixel-shuffle only.
+            m->cfg.n_img = m->vit_n_tokens;
+        } else if (m->vit_n_tokens > kk) {
+            // Bilinear upsample: verify the token count is a perfect square.
+            const int64_t g2_out = (int64_t) std::sqrt((double) m->vit_n_tokens);
+            if (g2_out * g2_out != m->vit_n_tokens) {
+                std::fprintf(stderr, "vla: smolvla vit geometry: upsampled token count %lld is not a perfect square\n",
+                             (long long) m->vit_n_tokens);
+                ggml_backend_free(m->backend);
+                delete m;
+                return nullptr;
+            }
+            m->cfg.n_img = m->vit_n_tokens;
+            std::printf("vla(smolvla): bilinear upsample enabled: %lld×%lld -> %lld×%lld = %lld tokens\n",
+                         (long long) k, (long long) k,
+                         (long long) g2_out, (long long) g2_out,
+                         (long long) m->vit_n_tokens);
+        } else {
             std::fprintf(stderr, "vla: smolvla vit geometry mismatch (grid=%lld scale=%lld -> %lld tokens, KV says %lld)\n",
-                         (long long) grid, (long long) m->vit_scale, (long long) (k * k), (long long) m->vit_n_tokens);
+                         (long long) grid, (long long) m->vit_scale, (long long) kk, (long long) m->vit_n_tokens);
             ggml_backend_free(m->backend);
             delete m;
             return nullptr;
         }
-        m->cfg.n_img = m->vit_n_tokens;
     }
     m->cfg.n_prefix = m->cfg.n_img + m->cfg.n_lang + m->cfg.n_state;
     m->cfg.n_full   = m->cfg.n_prefix + m->cfg.n_suffix;
@@ -1238,6 +1264,7 @@ SmolVLAModelArch* smolvla_load_impl(const std::string& mmproj_path,
     struct PendingBF16 { std::string name; ggml_tensor * t; };
     std::vector<PendingF32>  pending_f32;
     std::vector<PendingBF16> pending_bf16;
+    std::vector<PendingF32>  pending_sf;  // optional SnapFlow weights
 
     m->E_lang = ggml_new_tensor_2d(ctx, GGML_TYPE_BF16, cfg.hidden,  49280);
     pending_bf16.push_back({
@@ -1375,10 +1402,44 @@ SmolVLAModelArch* smolvla_load_impl(const std::string& mmproj_path,
     pending_f32.push_back({"model.action_time_mlp_out.weight", m->W_at2, {cfg.expert_h, cfg.expert_h}});
     pending_f32.push_back({"model.action_time_mlp_out.bias",   m->b_at2, {cfg.expert_h}});
 
+    // SnapFlow distilled time embedding MLP (optional)
+    m->W_st_mlp0 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, cfg.expert_h, cfg.expert_h);
+    m->b_st_mlp0 = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, cfg.expert_h);
+    m->W_st_mlp2 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, cfg.expert_h, cfg.expert_h);
+    m->b_st_mlp2 = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, cfg.expert_h);
+    pending_sf.push_back({"model.target_time_embed_mlp.0.weight", m->W_st_mlp0, {cfg.expert_h, cfg.expert_h}});
+    pending_sf.push_back({"model.target_time_embed_mlp.0.bias",   m->b_st_mlp0, {cfg.expert_h}});
+    pending_sf.push_back({"model.target_time_embed_mlp.2.weight", m->W_st_mlp2, {cfg.expert_h, cfg.expert_h}});
+    pending_sf.push_back({"model.target_time_embed_mlp.2.bias",   m->b_st_mlp2, {cfg.expert_h}});
+
     m->W_aout = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, cfg.expert_h, cfg.max_action_dim);
     m->b_aout = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, cfg.max_action_dim);
     pending_f32.push_back({"model.action_out_proj.weight", m->W_aout, {cfg.max_action_dim, cfg.expert_h}});
     pending_f32.push_back({"model.action_out_proj.bias",   m->b_aout, {cfg.max_action_dim}});
+
+    // SnapFlow time embedding MLP (optional — only in distilled checkpoints)
+    {
+        bool has_snapflow = false;
+        if (use_gguf) {
+            has_snapflow = gst.has_tensor("snapflow_time_mlp_0.weight");
+        } else {
+            has_snapflow = st.tensors.find("model.target_time_embed_mlp.0.weight") != st.tensors.end();
+        }
+        if (has_snapflow) {
+            m->W_st_mlp0 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, cfg.expert_h, cfg.expert_h);
+            m->b_st_mlp0 = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, cfg.expert_h);
+            m->W_st_mlp2 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, cfg.expert_h, cfg.expert_h);
+            m->b_st_mlp2 = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, cfg.expert_h);
+            pending_f32.push_back({"model.target_time_embed_mlp.0.weight", m->W_st_mlp0, {cfg.expert_h, cfg.expert_h}});
+            pending_f32.push_back({"model.target_time_embed_mlp.0.bias",   m->b_st_mlp0, {cfg.expert_h}});
+            pending_f32.push_back({"model.target_time_embed_mlp.2.weight", m->W_st_mlp2, {cfg.expert_h, cfg.expert_h}});
+            pending_f32.push_back({"model.target_time_embed_mlp.2.bias",   m->b_st_mlp2, {cfg.expert_h}});
+            std::printf("vla(smolvla): SnapFlow time MLP weights loaded (expert_h=%lld)\n",
+                        (long long) cfg.expert_h);
+        } else {
+            std::printf("vla(smolvla): SnapFlow time MLP not found — using standard concat+MLP path\n");
+        }
+    }
 
     m->time_bcasts.assign(cfg.num_steps, nullptr);
     for (int step = 0; step < cfg.num_steps; ++step) {
@@ -1427,6 +1488,35 @@ SmolVLAModelArch* smolvla_load_impl(const std::string& mmproj_path,
     }
     for (auto & p : pending_bf16) {
         if (!stream_bf16(p.name, p.t))         { delete m; return nullptr; }
+    }
+
+    // Optional: load SnapFlow distilled time embedding MLP.
+    // If any tensor is missing, fall back to standard action_time_mlp.
+    {
+        bool snapflow_ok = true;
+        for (auto & p : pending_sf) {
+            // Try loading from GGUF or safetensors without crashing on missing tensors.
+            std::vector<float> hbuf(ggml_nelements(p.t));
+            const bool ok = use_gguf
+                ? gst.read_to_f32(hf_to_gguf(p.name), hbuf.data(), p.shape)
+                : st .read_to_f32(p.name,             hbuf.data(), p.shape);
+            if (!ok) {
+                snapflow_ok = false;
+                break;
+            }
+            ggml_backend_tensor_set(p.t, hbuf.data(), 0, ggml_nbytes(p.t));
+        }
+        if (snapflow_ok) {
+            m->snapflow = true;
+            std::printf("vla: SnapFlow time MLP loaded (%zu tensors)\n", pending_sf.size());
+        } else {
+            // Reset pointers to indicate SnapFlow is not available.
+            for (auto & p : pending_sf) {
+                ggml_backend_tensor_set(p.t, std::vector<float>(ggml_nelements(p.t), 0.f).data(),
+                                        0, ggml_nbytes(p.t));
+            }
+            std::printf("vla: SnapFlow time MLP not found - using standard action_time_mlp\n");
+        }
     }
 
     {
@@ -1535,11 +1625,25 @@ bool build_compute_graph(SmolVLAModelArch* m, int n_views) {
     for (int step = 0; step < cfg.num_steps; ++step) {
         ggml_tensor * time_bcast     = m->time_bcasts[step];
         ggml_tensor * action_emb     = ggml_add(ctx, ggml_mul_mat(ctx, m->W_ain, x_t), m->b_ain);
-        ggml_tensor * action_time_in = ggml_concat(ctx, action_emb, time_bcast, 0);
-        ggml_tensor * mlp1           = ggml_add(ctx, ggml_mul_mat(ctx, m->W_at1, action_time_in), m->b_at1);
-        ggml_tensor * suffix_embs    = ggml_add(ctx,
-                                                ggml_mul_mat(ctx, m->W_at2, ggml_silu(ctx, mlp1)),
-                                                m->b_at2);
+        ggml_tensor * suffix_embs;
+        if (m->snapflow) {
+            // SnapFlow path: additive time embedding
+            // time_feat = W_st_mlp2 * SiLU(W_st_mlp0 * time_bcast + b_st_mlp0) + b_st_mlp2
+            // suffix_embs = action_emb + time_feat
+            ggml_tensor * time_feat = ggml_add(ctx,
+                ggml_mul_mat(ctx, m->W_st_mlp2,
+                    ggml_silu(ctx,
+                        ggml_add(ctx, ggml_mul_mat(ctx, m->W_st_mlp0, time_bcast), m->b_st_mlp0))),
+                m->b_st_mlp2);
+            suffix_embs = ggml_add(ctx, action_emb, time_feat);
+        } else {
+            // Standard path: concat(time, action) -> MLP
+            ggml_tensor * action_time_in = ggml_concat(ctx, action_emb, time_bcast, 0);
+            ggml_tensor * mlp1           = ggml_add(ctx, ggml_mul_mat(ctx, m->W_at1, action_time_in), m->b_at1);
+            suffix_embs = ggml_add(ctx,
+                                    ggml_mul_mat(ctx, m->W_at2, ggml_silu(ctx, mlp1)),
+                                    m->b_at2);
+        }
         ggml_tensor * h = suffix_embs;
         for (int li = 0; li < cfg.n_layers; ++li) {
             if (m->expert_layers[li].is_self_attn) {
@@ -1654,7 +1758,11 @@ std::vector<float> predict_impl(SmolVLAModelArch* m, const Inputs& in) {
             m->stats.ms_vision = 0.0f;
         } else {
             const int64_t H = m->vit_hidden, grid = m->vit_image / m->vit_patch, n_patches = grid * grid;
-            const int64_t s = m->vit_scale, c4 = H * s * s, K = m->vit_n_tokens;
+            const int64_t s = m->vit_scale, c4 = H * s * s;
+            const int64_t g2 = grid / s;           // pixel-shuffled grid dim
+            const int64_t K_in = g2 * g2;           // tokens after pixel-shuffle
+            const int64_t K_out = m->vit_n_tokens;  // tokens after upsampling (from GGUF KV)
+            const int64_t g2_out = (int64_t) std::sqrt((double) K_out);
             const auto t_vision_begin = clock::now();
 
         // Graph A: SigLIP ViT (conv patch-embed -> +pos -> layers -> post_ln), plain sequential positions.
@@ -1683,7 +1791,7 @@ std::vector<float> predict_impl(SmolVLAModelArch* m, const Inputs& in) {
         ggml_init_params vpB = { size_t(64) * 1024 * 1024, nullptr, true };
         ggml_context * MC = ggml_init(vpB);
         if (!MC) { std::fprintf(stderr, "vla(smolvla): ggml_init(connector ctx) failed\n"); ggml_gallocr_free(vgA); ggml_free(VC); return {}; }
-        ggml_tensor * t_shuf = ggml_new_tensor_2d(MC, GGML_TYPE_F32, c4, K); ggml_set_input(t_shuf);
+        ggml_tensor * t_shuf = ggml_new_tensor_2d(MC, GGML_TYPE_F32, c4, K_out); ggml_set_input(t_shuf);
         ggml_tensor * img_embeds = ggml_mul_mat(MC, m->mm_fc, t_shuf);
         ggml_set_output(img_embeds);
         ggml_cgraph * gB = ggml_new_graph(MC);
@@ -1994,11 +2102,23 @@ std::vector<float> predict_impl(SmolVLAModelArch* m, const Inputs& in) {
         time_bcasts[step] = time_bcast;
 
         ggml_tensor * action_emb     = ggml_add(ctx, ggml_mul_mat(ctx, m->W_ain, x_t), m->b_ain);
-        ggml_tensor * action_time_in = ggml_concat(ctx, action_emb, time_bcast, 0);
-        ggml_tensor * mlp1           = ggml_add(ctx, ggml_mul_mat(ctx, m->W_at1, action_time_in), m->b_at1);
-        ggml_tensor * suffix_embs    = ggml_add(ctx,
-                                                ggml_mul_mat(ctx, m->W_at2, ggml_silu(ctx, mlp1)),
-                                                m->b_at2);
+        ggml_tensor * suffix_embs;
+        if (m->W_st_mlp0) {
+            // SnapFlow path: additive time embedding
+            ggml_tensor * time_feat = ggml_add(ctx,
+                ggml_mul_mat(ctx, m->W_st_mlp2,
+                    ggml_silu(ctx,
+                        ggml_add(ctx, ggml_mul_mat(ctx, m->W_st_mlp0, time_bcast), m->b_st_mlp0))),
+                m->b_st_mlp2);
+            suffix_embs = ggml_add(ctx, action_emb, time_feat);
+        } else {
+            // Standard path: concat(time, action) -> MLP
+            ggml_tensor * action_time_in = ggml_concat(ctx, action_emb, time_bcast, 0);
+            ggml_tensor * mlp1           = ggml_add(ctx, ggml_mul_mat(ctx, m->W_at1, action_time_in), m->b_at1);
+            suffix_embs = ggml_add(ctx,
+                                    ggml_mul_mat(ctx, m->W_at2, ggml_silu(ctx, mlp1)),
+                                    m->b_at2);
+        }
 
         ggml_tensor * h = suffix_embs;
         for (int li = 0; li < cfg.n_layers; ++li) {
