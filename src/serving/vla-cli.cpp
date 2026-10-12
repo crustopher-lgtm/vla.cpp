@@ -44,6 +44,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <string>
 #include <vector>
@@ -394,7 +395,45 @@ int main(int argc, char ** argv) {
         in.attention_mask_n = (int) attn.size();
     }
     in.state       = state.data();
-    in.noise       = nullptr;  // predict() samples N(0,1) when omitted
+    // Pin the flow-matching start noise from a raw little-endian float32 file so
+    // two runs -- and two backends -- can be compared action-for-action. Unset
+    // leaves in.noise null and predict() samples N(0,1), exactly as before.
+    std::vector<float> noise;
+    const char * noise_path = std::getenv("VLA_NOISE_FILE");
+    if (noise_path && *noise_path) {
+        const size_t want = (size_t) cfg.n_suffix * (size_t) cfg.max_action_dim;
+        std::FILE * nf = std::fopen(noise_path, "rb");
+        if (!nf) {
+            std::fprintf(stderr, "vla-cli: VLA_NOISE_FILE '%s': %s\n",
+                         noise_path, std::strerror(errno));
+            model_free(m);
+            return 1;
+        }
+        std::fseek(nf, 0, SEEK_END);
+        const long bytes = std::ftell(nf);
+        std::fseek(nf, 0, SEEK_SET);
+        if (bytes != (long) (want*sizeof(float))) {
+            std::fprintf(stderr, "vla-cli: VLA_NOISE_FILE '%s' is %ld bytes, expected %zu "
+                                 "(n_suffix %lld x max_action_dim %lld x 4)\n",
+                         noise_path, bytes, want*sizeof(float),
+                         (long long) cfg.n_suffix, (long long) cfg.max_action_dim);
+            std::fclose(nf);
+            model_free(m);
+            return 1;
+        }
+        noise.resize(want);
+        if (std::fread(noise.data(), sizeof(float), want, nf) != want) {
+            std::fprintf(stderr, "vla-cli: VLA_NOISE_FILE '%s': short read\n", noise_path);
+            std::fclose(nf);
+            model_free(m);
+            return 1;
+        }
+        std::fclose(nf);
+        in.noise = noise.data();
+        std::fprintf(stderr, "vla-cli: noise pinned from %s (%zu float32)\n", noise_path, want);
+    } else {
+        in.noise = nullptr;  // predict() samples N(0,1) when omitted
+    }
 
     std::vector<float> act = predict(m, in);
     if (act.empty()) {
